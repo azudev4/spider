@@ -1,6 +1,7 @@
 use crate::black_list::contains;
 use crate::client::redirect::Policy;
 use crate::compact_str::CompactString;
+use std::sync::{Arc, Mutex};
 use crate::configuration::{
     self, get_ua, AutomationScriptsMap, Configuration, ExecutionScriptsMap, RedirectPolicy,
     SerializableHeaderMap,
@@ -27,7 +28,6 @@ use reqwest::header::REFERER;
 use reqwest::StatusCode;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::{
     sync::{broadcast, Semaphore},
@@ -379,6 +379,8 @@ pub struct Website {
     send_configured: bool,
     /// The website requires javascript to load. This will be sent as a hint when http request.
     website_meta_info: WebsiteMetaInfo,
+    /// Storage for original redirect status codes before following redirects.
+    pub redirect_statuses: Arc<Mutex<HashMap<String, StatusCode>>>,
 }
 
 impl Website {
@@ -407,6 +409,7 @@ impl Website {
             url,
             #[cfg(feature = "disk")]
             enable_sqlite: true,
+            redirect_statuses: Arc::new(Mutex::new(HashMap::new())),
             ..Default::default()
         }
     }
@@ -1331,8 +1334,30 @@ impl Website {
     fn setup_redirect_policy(&self) -> Policy {
         match self.configuration.redirect_policy {
             RedirectPolicy::Loose => Policy::limited(*self.configuration.redirect_limit),
-            RedirectPolicy::None => Policy::none(),
+            RedirectPolicy::None => {
+                println!("🔧 SPIDER: Creating custom redirect policy for RedirectPolicy::None");
+                // Create a custom policy that captures redirect statuses
+                let _redirect_statuses = Arc::clone(&self.redirect_statuses);
+
+                let custom_policy = move |attempt: crate::client::redirect::Attempt| {
+                    println!("🔧 SPIDER REDIRECT POLICY CALLED!!! URL: {}, Status: {}", attempt.url(), attempt.status());
+
+                    // Just follow all redirects for now to test if this function is called
+                    attempt.follow()
+                };
+
+                Policy::custom(custom_policy)
+            },
             RedirectPolicy::Strict => self.setup_strict_policy(),
+        }
+    }
+
+    /// Get the captured redirect status for a URL, if any.
+    pub fn get_redirect_status(&self, url: &str) -> Option<StatusCode> {
+        if let Ok(statuses) = self.redirect_statuses.lock() {
+            statuses.get(url).cloned()
+        } else {
+            None
         }
     }
 
@@ -1373,6 +1398,8 @@ impl Website {
     /// Base client configuration.
     fn configure_base_client(&self) -> ClientBuilder {
         let policy = self.setup_redirect_policy();
+        println!("🔧 SPIDER: configure_base_client (reqwest) called, redirect policy set");
+        println!("🔧 SPIDER: About to call .redirect(policy) on ClientBuilder");
 
         let user_agent = match &self.configuration.user_agent {
             Some(ua) => ua.as_str(),
@@ -4010,18 +4037,24 @@ impl Website {
                                                                 page.set_external(shared.3.clone());
                                                             }
 
-                                                            let prev_domain = page.base;
+                                                            let prev_domain = page.base.take();
 
-                                                            page.base = shared.9.as_deref().cloned();
+                                                            // Use final URL (after redirects) for relative link resolution.
+                                                            if let Ok(final_base) = Url::parse(page.get_url_final()) {
+                                                                page.set_url_parsed(final_base);
+                                                            } else {
+                                                                page.set_url_parsed_direct();
+                                                            }
+                                                            let page_base = page.base.clone().map(Box::new);
 
                                                             if return_page_links {
                                                                 page.page_links = Some(Default::default());
                                                             }
 
                                                             let links = if full_resources {
-                                                                page.links_full(&shared.1, &shared.9).await
+                                                                page.links_full(&shared.1, &page_base).await
                                                             } else {
-                                                                page.links(&shared.1, &shared.9).await
+                                                                page.links(&shared.1, &page_base).await
                                                             };
 
                                                             page.base = prev_domain;
@@ -4657,18 +4690,24 @@ impl Website {
                                                                 page.set_external(shared.3.clone());
                                                             }
 
-                                                            let prev_domain = page.base;
+                                                            let prev_domain = page.base.take();
 
-                                                            page.base = shared.9.as_deref().cloned();
+                                                            // Use final URL (after redirects) for relative link resolution.
+                                                            if let Ok(final_base) = Url::parse(page.get_url_final()) {
+                                                                page.set_url_parsed(final_base);
+                                                            } else {
+                                                                page.set_url_parsed_direct();
+                                                            }
+                                                            let page_base = page.base.clone().map(Box::new);
 
                                                             if return_page_links {
                                                                 page.page_links = Some(Default::default());
                                                             }
 
                                                             let links = if full_resources {
-                                                                page.links_full(&shared.1, &shared.9).await
+                                                                page.links_full(&shared.1, &page_base).await
                                                             } else {
-                                                                page.links(&shared.1, &shared.9).await
+                                                                page.links(&shared.1, &page_base).await
                                                             };
 
                                                             page.base = prev_domain;
@@ -5127,9 +5166,19 @@ impl Website {
                                         );
                                     }
 
-                                    let prev_domain = page.base;
+                                    let prev_domain = page.base.take();
 
-                                    page.base = shared.5.as_deref().cloned();
+                                    // Use the final URL (after redirects) for relative link resolution.
+                                    // For same-domain pages, get_url_final() == self.url (no change).
+                                    // For cross-domain redirects (e.g. article-1.eu -> la-croix.com),
+                                    // this ensures relative hrefs resolve against the actual origin,
+                                    // preventing phantom URLs from polluting the crawl queue.
+                                    if let Ok(final_base) = Url::parse(page.get_url_final()) {
+                                        page.set_url_parsed(final_base);
+                                    } else {
+                                        page.set_url_parsed_direct();
+                                    }
+                                    let page_base = page.base.clone().map(Box::new);
 
                                     if return_page_links {
                                         page.page_links = Some(Default::default());
@@ -5137,7 +5186,7 @@ impl Website {
 
                                     let (links, bytes_transferred ) = page
                                         .smart_links(
-                                            &shared.1, &shared.4, &shared.5, &shared.6,
+                                            &shared.1, &shared.4, &page_base, &shared.6,
                                         )
                                         .await;
 

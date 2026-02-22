@@ -2014,11 +2014,13 @@ impl Page {
 
                 let base = base.as_deref();
 
-                // original domain to match local pages.
-                let original_page = {
-                    self.set_url_parsed_direct_empty();
-                    self.get_url_parsed_ref().as_ref()
+                // Use final URL after redirects as base for relative link
+                // resolution (see links_stream_smart for full rationale).
+                let redirect_base = {
+                    let effective_url = self.get_url_final();
+                    Url::parse(effective_url).ok()
                 };
+                let original_page = redirect_base.as_ref();
 
                 let xml_file = self.get_url().ends_with(".xml");
 
@@ -2158,11 +2160,13 @@ impl Page {
 
                 let base = base.as_deref();
 
-                // original domain to match local pages.
-                let original_page = {
-                    self.set_url_parsed_direct_empty();
-                    self.get_url_parsed_ref().as_ref()
+                // Use final URL after redirects as base for relative link
+                // resolution (see links_stream_smart for full rationale).
+                let redirect_base_ssg = {
+                    let effective_url = self.get_url_final();
+                    Url::parse(effective_url).ok()
                 };
+                let original_page = redirect_base_ssg.as_ref();
 
                 let xml_file = self.get_url().ends_with(".xml");
 
@@ -2418,12 +2422,25 @@ impl Page {
 
                 let external_domains_caseless = self.external_domains_caseless.clone();
 
+                // When the page followed a cross-domain redirect, use the final
+                // URL as the base for resolving relative links. This prevents
+                // cross-domain redirects from polluting the crawl queue:
+                // e.g. article-1.eu/page 301→ la-croix.com/article means
+                // href="/Religion/..." must resolve against la-croix.com, not
+                // article-1.eu.  parent_host_match then naturally rejects them.
+                let effective_base: Option<Box<Url>> = {
+                    let final_url = self.get_url_final();
+                    Url::parse(final_url).ok().map(Box::new)
+                };
+                // Shadow the outer `base` parameter so all downstream code
+                // (including the lol_html closure) uses the redirect-aware base.
+                let base = &effective_base;
+
                 let base1 = base.as_deref();
 
-                // original domain to match local pages.
                 let original_page = {
-                    self.set_url_parsed_direct_empty();
-                    self.get_url_parsed_ref().as_ref().cloned()
+                    let effective_url = self.get_url_final();
+                    Url::parse(effective_url).ok()
                 };
 
                 let rerender = AtomicBool::new(false);
@@ -2667,13 +2684,15 @@ impl Page {
 
                     match rx.await {
                         Ok(v) => {
+                            let rendered_html = match v.content {
+                                Some(h) => auto_encode_bytes(&h),
+                                _ => Default::default(),
+                            };
+
                             let extended_map = self
                                 .links_stream_base::<A>(
                                     selectors,
-                                    &match v.content {
-                                        Some(h) => auto_encode_bytes(&h),
-                                        _ => Default::default(),
-                                    },
+                                    &rendered_html,
                                     &base1.as_deref().cloned().map(Box::new),
                                 )
                                 .await;
@@ -2778,12 +2797,18 @@ impl Page {
 
                 let external_domains_caseless = self.external_domains_caseless.clone();
 
+                // Shadow `base` with redirect-aware version (see not(full_resources) variant).
+                let effective_base: Option<Box<Url>> = {
+                    let final_url = self.get_url_final();
+                    Url::parse(final_url).ok().map(Box::new)
+                };
+                let base = &effective_base;
+
                 let base1 = base.as_deref();
 
-                // original domain to match local pages.
                 let original_page = {
-                    self.set_url_parsed_direct_empty();
-                    self.get_url_parsed_ref().as_ref().cloned()
+                    let effective_url = self.get_url_final();
+                    Url::parse(effective_url).ok()
                 };
 
                 let rerender = AtomicBool::new(false);
@@ -3025,13 +3050,22 @@ impl Page {
 
                     match rx.await {
                         Ok(v) => {
+                            let rendered_html = match v.content {
+                                Some(h) => auto_encode_bytes(&h),
+                                _ => Default::default(),
+                            };
+
+                            // Store Chrome-rendered HTML back into the page so downstream
+                            // consumers (subscription channel -> PageProcessor) see the same
+                            // DOM that Spider used for link discovery.
+                            if !rendered_html.is_empty() {
+                                self.html = Some(Box::new(rendered_html.as_bytes().to_vec()));
+                            }
+
                             let extended_map = self
                                 .links_stream_base::<A>(
                                     selectors,
-                                    &match v.content {
-                                        Some(h) => auto_encode_bytes(&h),
-                                        _ => Default::default(),
-                                    },
+                                    &rendered_html,
                                     &base.as_deref().cloned().map(Box::new),
                                 )
                                 .await;
@@ -3121,10 +3155,11 @@ impl Page {
 
                 let base = base.as_deref();
 
-                // original domain to match local pages.
+                // Use final URL after redirects as base for relative link
+                // resolution (see links_stream_smart for full rationale).
                 let original_page = {
-                    self.set_url_parsed_direct_empty();
-                    self.get_url_parsed_ref().as_ref().cloned()
+                    let effective_url = self.get_url_final();
+                    Url::parse(effective_url).ok()
                 };
 
                 let external_domains_caseless = self.external_domains_caseless.clone();
