@@ -26,7 +26,7 @@ use hashbrown::{HashMap, HashSet};
 use reqwest::header::REFERER;
 use reqwest::StatusCode;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicI8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::{
@@ -379,6 +379,11 @@ pub struct Website {
     send_configured: bool,
     /// The website requires javascript to load. This will be sent as a hint when http request.
     website_meta_info: WebsiteMetaInfo,
+    /// Runtime-mutable per-request delay in milliseconds. Workers read this atomic
+    /// before each request so callers can change throttling mid-crawl (e.g., on
+    /// bot-protection escalation). Synced from `configuration.delay` at crawl start;
+    /// can be mutated externally via the handle from `dynamic_delay_handle()`.
+    dynamic_delay: Arc<AtomicU64>,
 }
 
 impl Website {
@@ -1921,16 +1926,29 @@ impl Website {
     }
 
     /// Setup shared concurrent configs.
+    ///
+    /// Returns the interval and the runtime-mutable delay handle. The handle is
+    /// initialized from `configuration.delay` here so that any updates made before
+    /// the crawl starts (incl. via robots.txt parsing) are picked up; callers that
+    /// want to mutate it mid-crawl should use `dynamic_delay_handle()` to get an
+    /// independent clone.
     fn setup_crawl(
         &self,
     ) -> (
         std::pin::Pin<Box<tokio::time::Interval>>,
-        std::pin::Pin<Box<Duration>>,
+        Arc<AtomicU64>,
     ) {
+        self.dynamic_delay
+            .store(self.configuration.delay, Ordering::Relaxed);
         let interval = Box::pin(tokio::time::interval(Duration::from_millis(10)));
-        let throttle = Box::pin(self.get_delay());
+        (interval, self.dynamic_delay.clone())
+    }
 
-        (interval, throttle)
+    /// Public handle to the runtime-mutable per-request delay (in milliseconds).
+    /// Cloning the returned `Arc` is cheap; mutating via `.store(ms, Ordering::Relaxed)`
+    /// changes the throttle for all in-flight workers on their next sleep.
+    pub fn dynamic_delay_handle(&self) -> Arc<AtomicU64> {
+        self.dynamic_delay.clone()
     }
 
     /// Get all the expanded links.
@@ -3569,12 +3587,12 @@ impl Website {
 
             // track budgeting one time.
             let mut exceeded_budget = false;
-            let concurrency = throttle.is_zero();
+            let concurrency = throttle.load(Ordering::Relaxed) == 0;
 
             self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
 
             if !concurrency && !links.is_empty() {
-                tokio::time::sleep(*throttle).await;
+                tokio::time::sleep(Duration::from_millis(throttle.load(Ordering::Relaxed))).await;
             }
 
             let crawl_breaker = if self.configuration.crawl_timeout.is_some() {
@@ -3589,7 +3607,7 @@ impl Website {
 
                 loop {
                     if !concurrency {
-                        tokio::time::sleep(*throttle).await;
+                        tokio::time::sleep(Duration::from_millis(throttle.load(Ordering::Relaxed))).await;
                     }
 
                     let semaphore =
@@ -3839,12 +3857,12 @@ impl Website {
                             let full_resources = self.configuration.full_resources;
                             let return_page_links = self.configuration.return_page_links;
                             let mut exceeded_budget = false;
-                            let concurrency = throttle.is_zero();
+                            let concurrency = throttle.load(Ordering::Relaxed) == 0;
 
                             self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
 
                             if !concurrency && !links.is_empty() {
-                                tokio::time::sleep(*throttle).await;
+                                tokio::time::sleep(Duration::from_millis(throttle.load(Ordering::Relaxed))).await;
                             }
 
                             let crawl_breaker = if self.configuration.crawl_timeout.is_some() {
@@ -3860,7 +3878,7 @@ impl Website {
 
                                 loop {
                                     if !concurrency {
-                                        tokio::time::sleep(*throttle).await;
+                                        tokio::time::sleep(Duration::from_millis(throttle.load(Ordering::Relaxed))).await;
                                     }
 
                                     let semaphore =
@@ -4190,14 +4208,14 @@ impl Website {
 
             // track budgeting one time.
             let mut exceeded_budget = false;
-            let concurrency = throttle.is_zero();
+            let concurrency = throttle.load(Ordering::Relaxed) == 0;
 
             website
                 .dequeue(&mut q, &mut links, &mut exceeded_budget)
                 .await;
 
             if !concurrency && !links.is_empty() {
-                tokio::time::sleep(*throttle).await;
+                tokio::time::sleep(Duration::from_millis(throttle.load(Ordering::Relaxed))).await;
             }
 
             let crawl_breaker = if self.configuration.crawl_timeout.is_some() {
@@ -4212,7 +4230,7 @@ impl Website {
 
                 loop {
                     if !concurrency {
-                        tokio::time::sleep(*throttle).await;
+                        tokio::time::sleep(Duration::from_millis(throttle.load(Ordering::Relaxed))).await;
                     }
 
                     let semaphore =
@@ -4486,14 +4504,14 @@ impl Website {
                             let full_resources = self.configuration.full_resources;
                             let return_page_links = self.configuration.return_page_links;
                             let mut exceeded_budget = false;
-                            let concurrency = throttle.is_zero();
+                            let concurrency = throttle.load(Ordering::Relaxed) == 0;
 
                             website
                                 .dequeue(&mut q, &mut links, &mut exceeded_budget)
                                 .await;
 
                             if !concurrency && !links.is_empty() {
-                                tokio::time::sleep(*throttle).await;
+                                tokio::time::sleep(Duration::from_millis(throttle.load(Ordering::Relaxed))).await;
                             }
 
                             let crawl_breaker = if self.configuration.crawl_timeout.is_some() {
@@ -4509,7 +4527,7 @@ impl Website {
 
                                 loop {
                                     if !concurrency {
-                                        tokio::time::sleep(*throttle).await;
+                                        tokio::time::sleep(Duration::from_millis(throttle.load(Ordering::Relaxed))).await;
                                     }
 
                                     let semaphore =
@@ -4850,7 +4868,11 @@ impl Website {
         self.configuration.configure_allowlist();
         let domain = self.url.inner().as_str();
         let mut interval = Box::pin(tokio::time::interval(Duration::from_millis(10)));
-        let throttle = Box::pin(self.get_delay());
+        // Sync the dynamic delay handle from configured value, then hand workers
+        // the atomic so they can read fresh on every sleep.
+        self.dynamic_delay
+            .store(self.configuration.delay, Ordering::Relaxed);
+        let throttle = self.dynamic_delay.clone();
         let on_link_find_callback = self.on_link_find_callback;
         // http worker verify
         let http_worker = std::env::var("SPIDER_WORKER")
@@ -5002,12 +5024,12 @@ impl Website {
 
             let add_external = self.configuration.external_domains_caseless.len() > 0;
             let mut exceeded_budget = false;
-            let concurrency = throttle.is_zero();
+            let concurrency = throttle.load(Ordering::Relaxed) == 0;
 
             self.dequeue(&mut q, &mut links, &mut exceeded_budget).await;
 
             if !concurrency && !links.is_empty() {
-                tokio::time::sleep(*throttle).await;
+                tokio::time::sleep(Duration::from_millis(throttle.load(Ordering::Relaxed))).await;
             }
 
             let crawl_breaker = if self.configuration.crawl_timeout.is_some() {
@@ -5022,7 +5044,7 @@ impl Website {
 
                 loop {
                     if !concurrency {
-                        tokio::time::sleep(*throttle).await;
+                        tokio::time::sleep(Duration::from_millis(throttle.load(Ordering::Relaxed))).await;
                     }
 
                     let semaphore =
