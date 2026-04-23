@@ -30,21 +30,45 @@ const TRACKING_PARAMS: &[&str] = &[
     "_",
     // WordPress internals (cron triggers appended to page URLs)
     "doing_wp_cron",
-    // Auth / redirect params (never change page content, just redirect targets)
+    // Auth / redirect params (never change page content, just redirect targets).
+    // Missing any of these creates the infinite-recursion trap where the login
+    // page links back to itself with the current URL embedded, and each hop
+    // adds another %25 layer of encoding.
     "redirect_to", "redirect", "return", "return_to", "returnto",
     "next", "continue", "destination", "go", "target",
+    "back", "back_url", "back_to", "backurl", "backto",
+    "from", "from_url",
     "reauth", "loggedout", "action",
+    // Full-text search queries — result pages are ephemeral and non-canonical.
+    // Kept distinct from filter params (`category`, `filter`, `tag`) which
+    // DO define canonical listing pages worth crawling.
+    "q", "s", "search", "query",
+    // View-state params: same content, different presentation. Sort order and
+    // layout don't define new canonical pages.
+    "sort", "order", "orderby",
+    "view", "display", "layout",
 ];
 
-/// Query parameters known to affect page content. When a URL has 3+ unknown params
-/// (not in TRACKING_PARAMS and not in this list), all unknown params are stripped
-/// to prevent app-state URLs from polluting crawl results.
+/// Threshold for the "strip all unknowns" heuristic. When a URL has this many
+/// or more params that are neither tracking nor allowlisted content, we assume
+/// the URL is app-state noise and strip all non-allowlisted params.
+///
+/// Set aggressively low (2). If a real site uses custom param names as
+/// legitimate content filters (e.g. `?region=eu&currency=gbp`), fix by adding
+/// those names to `CONTENT_PARAMS` — don't raise this threshold, since that
+/// affects every site globally and masks the actual problem.
+const UNKNOWN_PARAM_COLLAPSE_THRESHOLD: usize = 2;
+
+/// Query parameters known to affect page content. When a URL has
+/// `UNKNOWN_PARAM_COLLAPSE_THRESHOLD`+ unknown params (not in TRACKING_PARAMS
+/// and not in this list), all unknown params are stripped to prevent app-state
+/// URLs from polluting crawl results.
 const CONTENT_PARAMS: &[&str] = &[
     // Pagination
     "page", "p", "pg", "paged", "offset", "start", "per_page",
-    // Filtering & search
-    "category", "cat", "filter", "sort", "order", "orderby",
-    "search", "q", "s", "query", "tag", "type",
+    // Filtering (canonical listing-page dimensions; search + sort + view
+    // params live in TRACKING_PARAMS — they don't define new canonical pages)
+    "category", "cat", "filter", "tag", "type",
     // Localization
     "lang", "language", "locale", "hl",
     // Content identifiers
@@ -52,8 +76,9 @@ const CONTENT_PARAMS: &[&str] = &[
     // Common CMS/ecommerce
     "product", "collection", "brand", "color", "size", "price",
     "min_price", "max_price", "rating", "stock", "availability",
-    // View controls
-    "view", "display", "layout", "tab", "section",
+    // Content sections (tab/section can point to genuinely different content
+    // on some sites; keep until proven otherwise)
+    "tab", "section",
 ];
 
 /// Stateful URL normalizer with an internal cache. Use when normalizing the
@@ -176,9 +201,9 @@ impl UrlNormalizer {
             })
             .collect();
 
-        // Pass 2: count unknown params — if 3+, strip them all
+        // Pass 2: count unknown params — if at/over threshold, strip them all
         let unknown_count = params.iter().filter(|(_, _, known)| !known).count();
-        if unknown_count >= 3 {
+        if unknown_count >= UNKNOWN_PARAM_COLLAPSE_THRESHOLD {
             params.retain(|(_, _, known)| *known);
         }
 
@@ -339,11 +364,11 @@ pub fn normalize_url_in_place(url: &mut Url) {
     // non-canonical URL than to lose it entirely.
 }
 
-/// Belt-and-suspenders check: returns true if the URL still has 3+ unknown
-/// query params after normalization. This should never fire because the
-/// normalizer already strips 3+ unknowns; keeping it explicit means that if
-/// the allowlist ever drifts, we drop the URL rather than silently re-adding
-/// noise back to the queue.
+/// Belt-and-suspenders check: returns true if the URL still has unknown-param
+/// count at/over `UNKNOWN_PARAM_COLLAPSE_THRESHOLD` after normalization. Should
+/// never fire because the normalizer already strips them; keeping it explicit
+/// means that if the allowlist ever drifts, we drop the URL rather than
+/// silently re-adding noise back to the queue.
 pub fn should_drop_url(url: &Url) -> bool {
     let query = match url.query() {
         Some(q) if !q.is_empty() => q,
@@ -358,7 +383,7 @@ pub fn should_drop_url(url: &Url) -> bool {
             !TRACKING_PARAMS.iter().any(|&t| t == kl) && !is_content_param(&kl)
         })
         .count();
-    unknown_count >= 3
+    unknown_count >= UNKNOWN_PARAM_COLLAPSE_THRESHOLD
 }
 
 // ---------------------------------------------------------------------------
@@ -408,8 +433,14 @@ mod tests {
     }
 
     #[test]
-    fn test_three_plus_unknown_params_stripped() {
+    fn test_at_threshold_unknowns_stripped() {
+        // 2 unknown params → collapsed under threshold=2
         let mut normalizer = UrlNormalizer::new();
+        assert_eq!(
+            normalizer.normalize("https://example.com/app?foo=1&bar=2"),
+            "https://example.com/app"
+        );
+        // 3 unknowns also stripped
         assert_eq!(
             normalizer.normalize("https://example.com/app?foo=1&bar=2&baz=3"),
             "https://example.com/app"
@@ -417,11 +448,26 @@ mod tests {
     }
 
     #[test]
-    fn test_two_unknown_params_kept() {
+    fn test_one_unknown_param_kept() {
+        // Single custom param could be legit, not collapsed
+        let mut normalizer = UrlNormalizer::new();
+        assert_eq!(
+            normalizer.normalize("https://example.com/page?custom=value"),
+            "https://example.com/page?custom=value"
+        );
+    }
+
+    #[test]
+    fn test_allowlisted_params_survive_regardless_of_count() {
+        // color + size are allowlisted, so they survive even when mixed with unknowns
         let mut normalizer = UrlNormalizer::new();
         assert_eq!(
             normalizer.normalize("https://example.com/products?color=red&size=large"),
             "https://example.com/products?color=red&size=large"
+        );
+        assert_eq!(
+            normalizer.normalize("https://example.com/shop?color=red&foo=1&bar=2"),
+            "https://example.com/shop?color=red"
         );
     }
 
@@ -485,5 +531,116 @@ mod tests {
             normalizer.normalize("https://example.com/page#section"),
             "https://example.com/page"
         );
+    }
+
+    #[test]
+    fn test_search_query_params_stripped() {
+        // `q`, `s`, `search`, `query` are search-box inputs — result pages are
+        // ephemeral and non-canonical, so they collapse to the search landing page.
+        let mut n = UrlNormalizer::new();
+        assert_eq!(
+            n.normalize("https://example.com/search?q=pizza"),
+            "https://example.com/search"
+        );
+        assert_eq!(
+            n.normalize("https://example.com/?s=shoes"),
+            "https://example.com"
+        );
+        assert_eq!(
+            n.normalize("https://example.com/find?search=hello&query=world"),
+            "https://example.com/find"
+        );
+    }
+
+    #[test]
+    fn test_search_variants_collapse_to_same_url() {
+        let mut n = UrlNormalizer::new();
+        let a = n.normalize("https://example.com/search?q=shoes");
+        let b = n.normalize("https://example.com/search?q=dress");
+        let c = n.normalize("https://example.com/search?q=hat");
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn test_filter_params_still_kept() {
+        // Filter params define canonical listing pages and must survive.
+        // (sort=price will be stripped — tested separately below.)
+        let mut n = UrlNormalizer::new();
+        assert_eq!(
+            n.normalize("https://example.com/shop?category=shoes"),
+            "https://example.com/shop?category=shoes"
+        );
+    }
+
+    #[test]
+    fn test_sort_and_order_stripped() {
+        let mut n = UrlNormalizer::new();
+        // Sort order is view state, not content
+        assert_eq!(
+            n.normalize("https://example.com/shop?sort=price&order=asc"),
+            "https://example.com/shop"
+        );
+        assert_eq!(
+            n.normalize("https://example.com/shop?orderby=date"),
+            "https://example.com/shop"
+        );
+    }
+
+    #[test]
+    fn test_view_layout_stripped() {
+        let mut n = UrlNormalizer::new();
+        // Grid vs list is presentation, same content
+        assert_eq!(
+            n.normalize("https://example.com/shop?view=grid"),
+            "https://example.com/shop"
+        );
+        assert_eq!(
+            n.normalize("https://example.com/shop?display=list&layout=wide"),
+            "https://example.com/shop"
+        );
+    }
+
+    #[test]
+    fn test_sort_variants_collapse_to_same_url() {
+        let mut n = UrlNormalizer::new();
+        let a = n.normalize("https://example.com/shop?category=shoes&sort=price&order=asc");
+        let b = n.normalize("https://example.com/shop?category=shoes&sort=price&order=desc");
+        let c = n.normalize("https://example.com/shop?category=shoes&sort=date");
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert_eq!(a, "https://example.com/shop?category=shoes");
+    }
+
+    #[test]
+    fn test_back_param_stripped() {
+        // Auth-return `back=` param — must be stripped to avoid the infinite
+        // recursion trap where each hop URL-encodes the previous one.
+        let mut n = UrlNormalizer::new();
+        assert_eq!(
+            n.normalize("https://example.com/login?back=https://example.com/home"),
+            "https://example.com/login"
+        );
+        // Nested-encoded variant (what the trap produces)
+        assert_eq!(
+            n.normalize("https://example.com/login?back=https://example.com/login%253Fback%253Dhttps://example.com/home"),
+            "https://example.com/login"
+        );
+    }
+
+    #[test]
+    fn test_all_auth_return_variants_collapse() {
+        // Every URL below goes to the same canonical /login page
+        let mut n = UrlNormalizer::new();
+        let a = n.normalize("https://example.com/login?back=/a");
+        let b = n.normalize("https://example.com/login?back_url=/b");
+        let c = n.normalize("https://example.com/login?back_to=/c");
+        let d = n.normalize("https://example.com/login?from=/d");
+        let e = n.normalize("https://example.com/login?return_to=/e");
+        assert_eq!(a, "https://example.com/login");
+        assert_eq!(b, "https://example.com/login");
+        assert_eq!(c, "https://example.com/login");
+        assert_eq!(d, "https://example.com/login");
+        assert_eq!(e, "https://example.com/login");
     }
 }
