@@ -13,6 +13,8 @@ pub mod header_utils;
 pub mod interner;
 /// A trie struct.
 pub mod trie;
+/// URL normalization (strips tracking params, collapses variants to canonical form).
+pub mod url_normalization;
 
 use crate::{
     page::{AntiBotTech, Metadata, STREAMING_CHUNK_SIZE},

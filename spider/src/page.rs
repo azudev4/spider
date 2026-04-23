@@ -544,6 +544,10 @@ pub(crate) fn push_link<A: PartialEq + Eq + std::hash::Hash + From<String>>(
         if abs.scheme() != parent_host_scheme.as_str() {
             let _ = abs.set_scheme(parent_host_scheme.as_str());
         }
+        crate::utils::url_normalization::normalize_url_in_place(&mut abs);
+        if crate::utils::url_normalization::should_drop_url(&abs) {
+            return;
+        }
         map.insert(abs.as_str().to_string().into());
     }
 }
@@ -576,6 +580,10 @@ pub(crate) fn push_link_verify<A: PartialEq + Eq + std::hash::Hash + From<String
     if let Some(mut abs) = abs {
         if abs.scheme() != parent_host_scheme.as_str() {
             let _ = abs.set_scheme(parent_host_scheme.as_str());
+        }
+        crate::utils::url_normalization::normalize_url_in_place(&mut abs);
+        if crate::utils::url_normalization::should_drop_url(&abs) {
+            return;
         }
         if verify {
             push_link_check(&mut abs, map, full_resources, &mut true);

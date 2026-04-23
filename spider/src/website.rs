@@ -396,7 +396,17 @@ impl Website {
             CaseInsensitiveString::new(&prepare_url(url)).into()
         };
 
-        let domain_parsed: Option<Box<Url>> = parse_absolute_url(&url);
+        // Normalize seed URL so it matches the canonical form that will be
+        // stored in links_visited once the crawl starts extracting links.
+        // Prevents a tracking-tagged start URL from being visited a second time
+        // via its clean canonical form.
+        let mut domain_parsed: Option<Box<Url>> = parse_absolute_url(&url);
+        let url: Box<CaseInsensitiveString> = if let Some(ref mut parsed) = domain_parsed {
+            crate::utils::url_normalization::normalize_url_in_place(parsed.as_mut());
+            CaseInsensitiveString::new(parsed.as_str()).into()
+        } else {
+            url
+        };
         let mut status = CrawlStatus::Start;
 
         if let Some(ref u) = domain_parsed {
@@ -446,7 +456,16 @@ impl Website {
             CaseInsensitiveString::new(&prepare_url(&url)).into()
         };
 
-        self.domain_parsed = parse_absolute_url(&domain);
+        // See Website::_new — normalize the seed so it lands in links_visited
+        // in the same canonical form that push_link produces for re-discoveries.
+        let mut domain_parsed = parse_absolute_url(&domain);
+        let domain: Box<CaseInsensitiveString> = if let Some(ref mut parsed) = domain_parsed {
+            crate::utils::url_normalization::normalize_url_in_place(parsed.as_mut());
+            CaseInsensitiveString::new(parsed.as_str()).into()
+        } else {
+            domain
+        };
+        self.domain_parsed = domain_parsed;
         self.url = domain;
         self
     }
