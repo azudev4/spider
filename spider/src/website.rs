@@ -384,6 +384,11 @@ pub struct Website {
     /// bot-protection escalation). Synced from `configuration.delay` at crawl start;
     /// can be mutated externally via the handle from `dynamic_delay_handle()`.
     dynamic_delay: Arc<AtomicU64>,
+    /// Per-crawl URL filter rules used by the link frontier
+    /// (`push_link` / `push_link_verify`) and the seed-URL normalizer.
+    /// `None` means "fall back to code defaults" — identical to the pre-config
+    /// behavior. Set via `Website::with_url_filter_config`.
+    url_filter: Option<Arc<crate::utils::url_normalization::ResolvedFilter>>,
 }
 
 impl Website {
@@ -6696,6 +6701,26 @@ impl Website {
     /// Set a crawl page limit. If the value is 0 there is no limit.
     pub fn with_limit(&mut self, limit: u32) -> &mut Self {
         self.configuration.with_limit(limit);
+        self
+    }
+
+    /// Install a URL filter for this crawl. The config is resolved once and
+    /// stored both on this `Website` (for introspection) and at the process
+    /// level via [`crate::utils::url_normalization::install_active_filter`]
+    /// — that's what the link-frontier normalization helpers read.
+    ///
+    /// No-op when `config` is `None` (default behavior preserved).
+    pub fn with_url_filter_config(
+        &mut self,
+        config: Option<crate::utils::url_normalization::URLFilterConfig>,
+    ) -> &mut Self {
+        if let Some(cfg) = config {
+            let resolved = std::sync::Arc::new(cfg.resolve());
+            crate::utils::url_normalization::install_active_filter(
+                std::sync::Arc::clone(&resolved),
+            );
+            self.url_filter = Some(resolved);
+        }
         self
     }
 

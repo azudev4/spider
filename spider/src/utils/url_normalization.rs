@@ -1,85 +1,290 @@
-/// Centralized URL normalization — mirrors crawler/src/utils/url_normalization.rs.
+/// Centralized URL normalization — the crawler re-exports `UrlNormalizer`
+/// + `is_trivial_redirect` from here so there's one source of truth.
 ///
-/// Keep this file byte-equivalent (minus the `use` line) with the crawler copy.
-/// Divergence between the two copies will break link-graph matching: the crawler
-/// re-normalizes URLs on DB insert (database/models.rs) and the two normalizations
-/// must produce identical strings.
+/// Behavior is now driven by a runtime [`URLFilterConfig`] — admins can
+/// override the defaults per client via the "launch a crawl" admin UI.
+/// Code-side defaults live in the `default_*_params()` functions below and
+/// still apply when no config is provided (backward compatible).
+use lazy_static::lazy_static;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use url::Url;
-use std::collections::HashMap;
 
-/// Tracking/analytics query parameters that should be stripped during normalization.
-/// These never change the page content - they're only used for attribution tracking.
-const TRACKING_PARAMS: &[&str] = &[
-    // Google Analytics / Ads
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "gclid", "gclsrc", "dclid", "gbraid", "wbraid",
-    // Facebook / Meta
-    "fbclid", "fb_action_ids", "fb_action_types", "fb_source", "fb_ref",
-    // Microsoft / Bing
-    "msclkid",
-    // HubSpot
-    "hsa_cam", "hsa_grp", "hsa_mt", "hsa_src", "hsa_ad", "hsa_acc",
-    "hsa_net", "hsa_ver", "hsa_la", "hsa_ol", "hsa_kw",
-    // Mailchimp
-    "mc_cid", "mc_eid",
-    // Generic tracking
-    "_ga", "_gl", "_hsenc", "_hsmi", "_openstat",
-    // Referral / session IDs (never change page content)
-    "ref", "ref_src", "referer", "referrer",
-    // jQuery / cache busters (never change page content)
-    "_",
-    // WordPress internals (cron triggers appended to page URLs)
-    "doing_wp_cron",
-    // Auth / redirect params (never change page content, just redirect targets).
-    // Missing any of these creates the infinite-recursion trap where the login
-    // page links back to itself with the current URL embedded, and each hop
-    // adds another %25 layer of encoding.
-    "redirect_to", "redirect", "return", "return_to", "returnto",
-    "next", "continue", "destination", "go", "target",
-    "back", "back_url", "back_to", "backurl", "backto",
-    "from", "from_url",
-    "reauth", "loggedout", "action",
-    // Full-text search queries — result pages are ephemeral and non-canonical.
-    // Kept distinct from filter params (`category`, `filter`, `tag`) which
-    // DO define canonical listing pages worth crawling.
-    "q", "s", "search", "query",
-    // View-state params: same content, different presentation. Sort order and
-    // layout don't define new canonical pages.
-    "sort", "order", "orderby",
-    "view", "display", "layout",
-];
+// ---------------------------------------------------------------------------
+// Categorized defaults
+// ---------------------------------------------------------------------------
+//
+// The strip list is split into named categories so the admin UI can toggle
+// the whole set on/off via `use_defaults`. Each category is a pure function
+// returning a static slice, not a const — stays source-of-truth for docs and
+// lets us build `all_default_strip_params()` once.
 
-/// Threshold for the "strip all unknowns" heuristic. When a URL has this many
-/// or more params that are neither tracking nor allowlisted content, we assume
-/// the URL is app-state noise and strip all non-allowlisted params.
-///
+/// Google/Facebook/Microsoft/HubSpot/Mailchimp tracking + referral params.
+/// Attribution tracking that never changes page content.
+pub fn default_tracking_analytics_params() -> &'static [&'static str] {
+    &[
+        // Google Analytics / Ads
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "gclid", "gclsrc", "dclid", "gbraid", "wbraid",
+        // Facebook / Meta
+        "fbclid", "fb_action_ids", "fb_action_types", "fb_source", "fb_ref",
+        // Microsoft / Bing
+        "msclkid",
+        // HubSpot
+        "hsa_cam", "hsa_grp", "hsa_mt", "hsa_src", "hsa_ad", "hsa_acc",
+        "hsa_net", "hsa_ver", "hsa_la", "hsa_ol", "hsa_kw",
+        // Mailchimp
+        "mc_cid", "mc_eid",
+        // Generic tracking
+        "_ga", "_gl", "_hsenc", "_hsmi", "_openstat",
+        // Referral / session IDs (never change page content)
+        "ref", "ref_src", "referer", "referrer",
+    ]
+}
+
+/// Search-query params. Result pages are ephemeral and non-canonical.
+pub fn default_search_params() -> &'static [&'static str] {
+    &["q", "s", "search", "query"]
+}
+
+/// Sort / view-state params. Same content, different presentation.
+pub fn default_sort_view_params() -> &'static [&'static str] {
+    &[
+        "sort", "order", "orderby",
+        "view", "display", "layout",
+    ]
+}
+
+/// Auth-return URLs. Missing any of these creates the infinite-recursion trap
+/// where login pages link back to themselves with the current URL embedded,
+/// each hop adding another %25 layer of encoding.
+pub fn default_auth_return_params() -> &'static [&'static str] {
+    &[
+        "redirect_to", "redirect", "return", "return_to", "returnto",
+        "next", "continue", "destination", "go", "target",
+        "back", "back_url", "back_to", "backurl", "backto",
+        "from", "from_url",
+    ]
+}
+
+/// WordPress internals and misc CMS junk. The jQuery `_` cache buster lives
+/// here too — it's WP-adjacent noise.
+pub fn default_wp_internals_params() -> &'static [&'static str] {
+    &[
+        "doing_wp_cron",
+        "_",
+        "reauth", "loggedout", "action",
+    ]
+}
+
+/// Content-affecting params preserved by the normalizer. These define
+/// canonical listing pages (pagination, filters, localization, etc.) and
+/// must survive the strip pass.
+pub fn default_content_params() -> &'static [&'static str] {
+    &[
+        // Pagination
+        "page", "p", "pg", "paged", "offset", "start", "per_page",
+        // Filtering (canonical listing-page dimensions; search + sort + view
+        // params live in the tracking lists — they don't define new canonical pages)
+        "category", "cat", "filter", "tag", "type",
+        // Localization
+        "lang", "language", "locale", "hl",
+        // Content identifiers
+        "id", "slug", "post_type",
+        // Common CMS/ecommerce
+        "product", "collection", "brand", "color", "size", "price",
+        "min_price", "max_price", "rating", "stock", "availability",
+        // Content sections (tab/section can point to genuinely different content
+        // on some sites; keep until proven otherwise)
+        "tab", "section",
+    ]
+}
+
+/// Union of all default strip categories. Used when building a
+/// [`ResolvedFilter`] from `URLFilterConfig { use_defaults: true }`.
+fn all_default_strip_params() -> impl Iterator<Item = &'static str> {
+    default_tracking_analytics_params().iter().copied()
+        .chain(default_search_params().iter().copied())
+        .chain(default_sort_view_params().iter().copied())
+        .chain(default_auth_return_params().iter().copied())
+        .chain(default_wp_internals_params().iter().copied())
+}
+
+/// Default for the "strip all unknowns when count >= N" heuristic.
 /// Set aggressively low (2). If a real site uses custom param names as
-/// legitimate content filters (e.g. `?region=eu&currency=gbp`), fix by adding
-/// those names to `CONTENT_PARAMS` — don't raise this threshold, since that
-/// affects every site globally and masks the actual problem.
-const UNKNOWN_PARAM_COLLAPSE_THRESHOLD: usize = 2;
+/// legitimate content filters, surface those via a team's
+/// `custom_keep_params` override rather than bumping this — the threshold
+/// is a blunt instrument.
+pub const DEFAULT_UNKNOWN_THRESHOLD: usize = 2;
 
-/// Query parameters known to affect page content. When a URL has
-/// `UNKNOWN_PARAM_COLLAPSE_THRESHOLD`+ unknown params (not in TRACKING_PARAMS
-/// and not in this list), all unknown params are stripped to prevent app-state
-/// URLs from polluting crawl results.
-const CONTENT_PARAMS: &[&str] = &[
-    // Pagination
-    "page", "p", "pg", "paged", "offset", "start", "per_page",
-    // Filtering (canonical listing-page dimensions; search + sort + view
-    // params live in TRACKING_PARAMS — they don't define new canonical pages)
-    "category", "cat", "filter", "tag", "type",
-    // Localization
-    "lang", "language", "locale", "hl",
-    // Content identifiers
-    "id", "slug", "post_type",
-    // Common CMS/ecommerce
-    "product", "collection", "brand", "color", "size", "price",
-    "min_price", "max_price", "rating", "stock", "availability",
-    // Content sections (tab/section can point to genuinely different content
-    // on some sites; keep until proven otherwise)
-    "tab", "section",
-];
+// ---------------------------------------------------------------------------
+// Runtime configuration (per-crawl, per-client)
+// ---------------------------------------------------------------------------
+
+/// Per-crawl URL filter configuration. Admin-editable via the "launch a crawl"
+/// section of the admin UI; stored on `teams.settings` as the team default and
+/// snapshotted onto `crawl_sessions.url_filter_config` for reprocess consistency.
+///
+/// An empty `URLFilterConfig::default()` produces the same normalization
+/// behavior as the old compile-time consts — full backward compatibility.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct URLFilterConfig {
+    /// When true or None (default), apply the full built-in strip ruleset
+    /// (tracking, search, sort/view, auth-return, WP internals).
+    /// When false, built-in defaults are skipped entirely and only
+    /// `custom_strip_params` is used.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub use_defaults: Option<bool>,
+
+    /// Additional param names to strip, on top of (or instead of) defaults.
+    /// Site-specific junk the built-in lists don't cover.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub custom_strip_params: Option<Vec<String>>,
+
+    /// Param names to preserve, overriding the strip list and the unknown-param
+    /// threshold. Used when a client genuinely treats `?pa_brand=acme` as a
+    /// canonical filter dimension.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub custom_keep_params: Option<Vec<String>>,
+
+    /// Override the unknown-param collapse threshold. Clamped to `[1, 10]`.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub unknown_param_threshold: Option<usize>,
+}
+
+/// Pre-computed hot-path form of a [`URLFilterConfig`]. Built once per crawl
+/// and shared via `Arc` across the spider link frontier and the post-fetch
+/// safety-net normalizers.
+#[derive(Debug, Clone)]
+pub struct ResolvedFilter {
+    /// Lowercased param names the normalizer strips outright.
+    strip: HashSet<String>,
+    /// Lowercased param names the normalizer always preserves (overrides both
+    /// strip and the unknown-count threshold).
+    keep: HashSet<String>,
+    /// If true, any param with a key starting with `_sfm_` is treated as
+    /// content (WordPress Search-and-Filter plugin). Always true today.
+    sfm_prefix: bool,
+    /// `[1, 10]` — collapse URL to its base when this many unknown params remain.
+    threshold: usize,
+}
+
+impl ResolvedFilter {
+    fn is_stripped(&self, key_lower: &str) -> bool {
+        // keep wins over strip — lets a team preserve a specific default param.
+        !self.is_kept(key_lower) && self.strip.contains(key_lower)
+    }
+
+    fn is_kept(&self, key_lower: &str) -> bool {
+        if self.keep.contains(key_lower) {
+            return true;
+        }
+        if self.sfm_prefix && key_lower.starts_with("_sfm_") {
+            return true;
+        }
+        false
+    }
+
+    fn threshold(&self) -> usize {
+        self.threshold
+    }
+}
+
+impl URLFilterConfig {
+    /// Build the hot-path [`ResolvedFilter`] from this config + code defaults.
+    pub fn resolve(&self) -> ResolvedFilter {
+        let mut strip: HashSet<String> = HashSet::new();
+
+        if self.use_defaults.unwrap_or(true) {
+            for name in all_default_strip_params() {
+                strip.insert(name.to_string());
+            }
+        }
+        if let Some(extras) = &self.custom_strip_params {
+            for name in extras {
+                let lower = name.trim().to_lowercase();
+                if !lower.is_empty() {
+                    strip.insert(lower);
+                }
+            }
+        }
+
+        let mut keep: HashSet<String> = default_content_params()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if let Some(extras) = &self.custom_keep_params {
+            for name in extras {
+                let lower = name.trim().to_lowercase();
+                if !lower.is_empty() {
+                    keep.insert(lower);
+                }
+            }
+        }
+
+        let threshold = self
+            .unknown_param_threshold
+            .unwrap_or(DEFAULT_UNKNOWN_THRESHOLD)
+            .clamp(1, 10);
+
+        ResolvedFilter {
+            strip,
+            keep,
+            sfm_prefix: true,
+            threshold,
+        }
+    }
+}
+
+lazy_static! {
+    /// Lazily-initialized default filter that produces the same output the
+    /// old compile-time consts did. Safe fallback when nothing else is installed.
+    static ref DEFAULT_FILTER: Arc<ResolvedFilter> =
+        Arc::new(URLFilterConfig::default().resolve());
+
+    /// Process-level active filter, read by every stateless normalization
+    /// helper. The crawler installs the session's filter via
+    /// [`install_active_filter`] at crawl startup and resets to defaults when
+    /// done. RwLock'd so multiple crawls in the same process (e.g. the GUI)
+    /// can swap filters sequentially; readers just clone the Arc.
+    static ref ACTIVE_FILTER: std::sync::RwLock<Arc<ResolvedFilter>> =
+        std::sync::RwLock::new(Arc::clone(&DEFAULT_FILTER));
+}
+
+/// Get a shared default filter. Useful when constructing a `UrlNormalizer`
+/// that should ignore any active filter installed on the process.
+pub fn default_filter() -> Arc<ResolvedFilter> {
+    Arc::clone(&DEFAULT_FILTER)
+}
+
+/// Return a cloned `Arc` of the currently-installed filter. All stateless
+/// helpers call this, so swapping via `install_active_filter` is enough to
+/// apply a custom config across the link frontier + post-fetch paths without
+/// touching every call site's signature.
+pub fn active_filter() -> Arc<ResolvedFilter> {
+    match ACTIVE_FILTER.read() {
+        Ok(guard) => Arc::clone(&*guard),
+        // Poisoned lock — fall back to defaults rather than panicking.
+        Err(_) => Arc::clone(&DEFAULT_FILTER),
+    }
+}
+
+/// Install a new active filter for the current process. Subsequent
+/// normalization calls pick it up. The crawler calls this once at crawl
+/// startup after resolving the session's `URLFilterConfig`.
+pub fn install_active_filter(filter: Arc<ResolvedFilter>) {
+    if let Ok(mut guard) = ACTIVE_FILTER.write() {
+        *guard = filter;
+    }
+}
+
+/// Restore the active filter to defaults (e.g. between crawls in the GUI).
+pub fn reset_active_filter() {
+    install_active_filter(Arc::clone(&DEFAULT_FILTER))
+}
 
 /// Stateful URL normalizer with an internal cache. Use when normalizing the
 /// same URL repeatedly; for one-off calls prefer `UrlNormalizer::normalize_once`
@@ -87,13 +292,31 @@ const CONTENT_PARAMS: &[&str] = &[
 pub struct UrlNormalizer {
     /// Cache for normalized URLs to avoid repeated parsing
     cache: HashMap<String, String>,
+    /// Filter rules — strip list, keep list, threshold.
+    filter: Arc<ResolvedFilter>,
 }
 
 impl UrlNormalizer {
-    /// Create a new normalizer with an empty cache.
+    /// Create a new normalizer backed by the process-active filter.
+    /// Use [`UrlNormalizer::with_filter`] when you need a specific filter
+    /// (e.g. per-call overrides). Use [`UrlNormalizer::with_defaults`] when
+    /// you want to explicitly ignore any process-installed override.
     pub fn new() -> Self {
+        Self::with_filter(active_filter())
+    }
+
+    /// Create a new normalizer with the code-level defaults, ignoring any
+    /// filter installed on the process.
+    pub fn with_defaults() -> Self {
+        Self::with_filter(default_filter())
+    }
+
+    /// Create a new normalizer backed by a specific resolved filter. Use this
+    /// when you have a per-crawl `URLFilterConfig` to apply.
+    pub fn with_filter(filter: Arc<ResolvedFilter>) -> Self {
         Self {
             cache: HashMap::new(),
+            filter,
         }
     }
 
@@ -174,9 +397,10 @@ impl UrlNormalizer {
     }
 
     /// Build a clean query string with hybrid filtering:
-    /// 1. Strip known tracking params (blocklist)
+    /// 1. Strip configured tracking params (blocklist)
     /// 2. Strip params with UUID-like values (heuristic)
-    /// 3. If 3+ unknown params remain, strip all non-allowlisted params
+    /// 3. If N+ unknown params remain (N = filter.threshold), strip all
+    ///    non-allowlisted params
     fn build_clean_query(&self, parsed: &Url) -> String {
         let query = match parsed.query() {
             Some(q) if !q.is_empty() => q,
@@ -195,25 +419,26 @@ impl UrlNormalizer {
                 }
                 let decoded_key = decode_query_component(key);
                 let key_lower = decoded_key.to_lowercase();
-                // Strip known tracking params
-                if TRACKING_PARAMS.iter().any(|&t| t == key_lower) {
+                // Strip params the filter marks as tracking — but `keep` wins so
+                // a team can preserve a specific default name via custom_keep.
+                if self.filter.is_stripped(&key_lower) {
                     return None;
                 }
                 let decoded_value = decode_query_component(value);
-                // Strip params with UUID-like values
-                if is_uuid_like(&decoded_value) {
+                // Strip params with UUID-like values (unless explicitly kept)
+                if !self.filter.is_kept(&key_lower) && is_uuid_like(&decoded_value) {
                     return None;
                 }
                 let norm_key = encode_query_component(&decoded_key);
                 let norm_value = encode_query_component(&decoded_value);
-                let is_known = is_content_param(&key_lower);
+                let is_known = self.filter.is_kept(&key_lower);
                 Some((norm_key, norm_value, is_known))
             })
             .collect();
 
         // Pass 2: count unknown params — if at/over threshold, strip them all
         let unknown_count = params.iter().filter(|(_, _, known)| !known).count();
-        if unknown_count >= UNKNOWN_PARAM_COLLAPSE_THRESHOLD {
+        if unknown_count >= self.filter.threshold() {
             params.retain(|(_, _, known)| *known);
         }
 
@@ -338,26 +563,26 @@ fn is_uuid_like(value: &str) -> bool {
     false
 }
 
-/// Check if a query param key is a known content-affecting parameter.
-/// Matches exact names from CONTENT_PARAMS and the _sfm_ prefix (SearchAndFilter plugin).
-fn is_content_param(key_lower: &str) -> bool {
-    if key_lower.starts_with("_sfm_") {
-        return true;
-    }
-    CONTENT_PARAMS.iter().any(|&p| p == key_lower)
-}
+// (is_content_param removed — the logic now lives on `ResolvedFilter`.)
 
 // ---------------------------------------------------------------------------
 // Spider-facing helpers (not in crawler copy — wrappers around the shared core)
 // ---------------------------------------------------------------------------
 
-/// Normalize a URL string. Convenience wrapper for `UrlNormalizer::normalize_once`.
+/// Normalize a URL string using the process-active filter (defaults when none
+/// installed). For ad-hoc custom filters use [`normalize_url_string_with`].
 #[inline]
 pub fn normalize_url_string(url: &str) -> String {
-    UrlNormalizer::normalize_once(url)
+    normalize_url_string_with(url, &active_filter())
 }
 
-/// Normalize a parsed `Url` in place.
+/// Normalize a URL string against a specific resolved filter.
+pub fn normalize_url_string_with(url: &str, filter: &Arc<ResolvedFilter>) -> String {
+    UrlNormalizer::with_filter(Arc::clone(filter)).normalize_internal(url)
+}
+
+/// Normalize a parsed `Url` in place using the default filter.
+/// For custom filters use [`normalize_url_in_place_with`].
 ///
 /// Used inside spider's `push_link` / `push_link_verify` / `push_link_check`
 /// so that `links_visited` dedupes by canonical form and we never fetch the same
@@ -366,7 +591,12 @@ pub fn normalize_url_string(url: &str) -> String {
 /// Idempotent: normalizing an already-normalized URL is a no-op (aside from the
 /// parse/format round-trip cost).
 pub fn normalize_url_in_place(url: &mut Url) {
-    let normalized = normalize_url_string(url.as_str());
+    normalize_url_in_place_with(url, &active_filter())
+}
+
+/// Normalize a parsed `Url` in place against a specific resolved filter.
+pub fn normalize_url_in_place_with(url: &mut Url, filter: &Arc<ResolvedFilter>) {
+    let normalized = normalize_url_string_with(url.as_str(), filter);
     if let Ok(parsed) = Url::parse(&normalized) {
         *url = parsed;
     }
@@ -375,11 +605,16 @@ pub fn normalize_url_in_place(url: &mut Url) {
 }
 
 /// Belt-and-suspenders check: returns true if the URL still has unknown-param
-/// count at/over `UNKNOWN_PARAM_COLLAPSE_THRESHOLD` after normalization. Should
+/// count at/over the default threshold after normalization. Should
 /// never fire because the normalizer already strips them; keeping it explicit
 /// means that if the allowlist ever drifts, we drop the URL rather than
 /// silently re-adding noise back to the queue.
 pub fn should_drop_url(url: &Url) -> bool {
+    should_drop_url_with(url, &active_filter())
+}
+
+/// Same as [`should_drop_url`], against a specific resolved filter.
+pub fn should_drop_url_with(url: &Url, filter: &Arc<ResolvedFilter>) -> bool {
     let query = match url.query() {
         Some(q) if !q.is_empty() => q,
         _ => return false,
@@ -390,10 +625,10 @@ pub fn should_drop_url(url: &Url) -> bool {
         .filter(|k| !k.is_empty())
         .filter(|k| {
             let kl = k.to_lowercase();
-            !TRACKING_PARAMS.iter().any(|&t| t == kl) && !is_content_param(&kl)
+            !filter.is_stripped(&kl) && !filter.is_kept(&kl)
         })
         .count();
-    unknown_count >= UNKNOWN_PARAM_COLLAPSE_THRESHOLD
+    unknown_count >= filter.threshold()
 }
 
 /// Detect "trivial" redirects where the destination differs from the source
@@ -781,4 +1016,149 @@ mod tests {
         assert!(!is_trivial_redirect("not a url", "https://example.com/foo"));
         assert!(!is_trivial_redirect("https://example.com/foo", "not a url"));
     }
+
+    // --- URLFilterConfig / ResolvedFilter ----------------------------------
+
+    #[test]
+    fn test_default_config_matches_legacy_behavior() {
+        // URLFilterConfig::default() must produce the same output as the
+        // previous hardcoded constants on a fixture of real-world URLs.
+        let filter = Arc::new(URLFilterConfig::default().resolve());
+        let mut n = UrlNormalizer::with_filter(filter);
+
+        assert_eq!(
+            n.normalize("https://example.com/page?utm_source=x&page=2"),
+            "https://example.com/page?page=2"
+        );
+        assert_eq!(
+            n.normalize("https://example.com/search?q=pizza"),
+            "https://example.com/search"
+        );
+        assert_eq!(
+            n.normalize("https://example.com/shop?sort=price"),
+            "https://example.com/shop"
+        );
+        assert_eq!(
+            n.normalize("https://example.com/login?back=/home"),
+            "https://example.com/login"
+        );
+    }
+
+    #[test]
+    fn test_use_defaults_false_keeps_everything() {
+        let cfg = URLFilterConfig {
+            use_defaults: Some(false),
+            ..Default::default()
+        };
+        let filter = Arc::new(cfg.resolve());
+        let mut n = UrlNormalizer::with_filter(filter);
+        // utm_source is a default-tracking param; with defaults off it survives.
+        assert_eq!(
+            n.normalize("https://example.com/page?utm_source=foo"),
+            "https://example.com/page?utm_source=foo"
+        );
+    }
+
+    #[test]
+    fn test_custom_strip_params_add_to_strip() {
+        let cfg = URLFilterConfig {
+            custom_strip_params: Some(vec!["ref_id".to_string(), "SESSION_KEY".to_string()]),
+            ..Default::default()
+        };
+        let filter = Arc::new(cfg.resolve());
+        let mut n = UrlNormalizer::with_filter(filter);
+        // case-insensitive match
+        assert_eq!(
+            n.normalize("https://example.com/page?ref_id=abc&session_key=xyz"),
+            "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn test_custom_keep_wins_over_default_strip() {
+        // utm_source is normally stripped; custom_keep should override.
+        let cfg = URLFilterConfig {
+            custom_keep_params: Some(vec!["utm_source".to_string()]),
+            ..Default::default()
+        };
+        let filter = Arc::new(cfg.resolve());
+        let mut n = UrlNormalizer::with_filter(filter);
+        assert_eq!(
+            n.normalize("https://example.com/page?utm_source=ab"),
+            "https://example.com/page?utm_source=ab"
+        );
+    }
+
+    #[test]
+    fn test_custom_keep_survives_unknown_threshold() {
+        // Normally 2+ unknowns collapse everything. With pa_brand explicitly
+        // kept, it survives even when mixed with other unknowns.
+        let cfg = URLFilterConfig {
+            custom_keep_params: Some(vec!["pa_brand".to_string()]),
+            ..Default::default()
+        };
+        let filter = Arc::new(cfg.resolve());
+        let mut n = UrlNormalizer::with_filter(filter);
+        assert_eq!(
+            n.normalize("https://example.com/shop?pa_brand=acme&foo=1&bar=2"),
+            "https://example.com/shop?pa_brand=acme"
+        );
+    }
+
+    #[test]
+    fn test_threshold_override() {
+        let cfg = URLFilterConfig {
+            unknown_param_threshold: Some(5),
+            ..Default::default()
+        };
+        let filter = Arc::new(cfg.resolve());
+        let mut n = UrlNormalizer::with_filter(filter);
+        // With threshold=5, 4 unknowns survive as-is.
+        let url = n.normalize("https://example.com/app?a=1&b=2&c=3&d=4");
+        assert!(url.contains("a=1"));
+        assert!(url.contains("b=2"));
+        assert!(url.contains("c=3"));
+        assert!(url.contains("d=4"));
+    }
+
+    #[test]
+    fn test_threshold_clamped_to_one_ten() {
+        let cfg_low = URLFilterConfig {
+            unknown_param_threshold: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(cfg_low.resolve().threshold(), 1);
+
+        let cfg_high = URLFilterConfig {
+            unknown_param_threshold: Some(9999),
+            ..Default::default()
+        };
+        assert_eq!(cfg_high.resolve().threshold(), 10);
+    }
+
+    #[test]
+    fn test_config_idempotent_normalization() {
+        let cfg = URLFilterConfig {
+            custom_strip_params: Some(vec!["weird".to_string()]),
+            custom_keep_params: Some(vec!["pa_brand".to_string()]),
+            unknown_param_threshold: Some(3),
+            ..Default::default()
+        };
+        let filter = Arc::new(cfg.resolve());
+
+        let fixtures = [
+            "https://example.com/shop?pa_brand=acme",
+            "https://example.com/page?weird=x&page=2",
+            "https://example.com/foo/?utm_source=x&a=1",
+            "https://example.com/search?q=hello",
+        ];
+
+        for raw in fixtures {
+            let once = normalize_url_string_with(raw, &filter);
+            let twice = normalize_url_string_with(&once, &filter);
+            assert_eq!(once, twice, "non-idempotent for {raw}");
+        }
+    }
+
+    // Serde round-trip is tested crawler-side where serde_json is a regular dep.
 }
