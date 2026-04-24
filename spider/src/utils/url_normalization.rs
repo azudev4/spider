@@ -97,9 +97,17 @@ impl UrlNormalizer {
         }
     }
 
-    /// Normalize URL for consistent comparison across all crawler components
-    /// Removes: fragments, trailing slashes, tracking params, default ports
-    /// Keeps: scheme, host, path, meaningful query params (sorted)
+    /// Normalize URL for consistent comparison across all crawler components.
+    ///
+    /// Removes: fragments, tracking params, default ports.
+    /// Keeps: scheme, host, path (including trailing slash — the site's own
+    /// linking decides the canonical form), meaningful query params (sorted).
+    ///
+    /// Trailing-slash variants (`/foo` vs `/foo/`) stay distinct on purpose:
+    /// forcing a canonical form globally would make us fetch the non-canonical
+    /// variant on every WordPress/Apache site, eating crawl budget on 301 rows.
+    /// The trivial-redirect dedup in `is_trivial_redirect` + the skip-rule in
+    /// `build_page_entry` handles the cleanup downstream.
     pub fn normalize(&mut self, url: &str) -> String {
         // Check cache first
         if let Some(cached) = self.cache.get(url) {
@@ -129,7 +137,9 @@ impl UrlNormalizer {
         if let Ok(parsed) = Url::parse(&url) {
             // Lowercase path to match Spider's CaseInsensitiveString behaviour —
             // prevents BFS mismatches between /Monde/... and /monde/...
-            let path = parsed.path().trim_end_matches('/').to_lowercase();
+            // Trailing slashes are preserved — the site's own links decide the
+            // canonical form.
+            let path = parsed.path().to_lowercase();
 
             // Build host with non-default port only
             let host_with_port = if let Some(port) = parsed.port() {
@@ -158,8 +168,8 @@ impl UrlNormalizer {
                 format!("{}?{}", base, query_string)
             }
         } else {
-            // Fallback for unparseable URLs
-            url.trim_end_matches('/').to_string()
+            // Fallback for unparseable URLs — return as-is (trailing slashes preserved)
+            url.to_string()
         }
     }
 
@@ -386,6 +396,34 @@ pub fn should_drop_url(url: &Url) -> bool {
     unknown_count >= UNKNOWN_PARAM_COLLAPSE_THRESHOLD
 }
 
+/// Detect "trivial" redirects where the destination differs from the source
+/// only by: trailing slash on path, `www.` subdomain prefix, scheme
+/// (http/https), or path case. Any mix of those counts.
+///
+/// Used at page-insert time to skip recording 301 rows that carry no new
+/// information. Query-string / fragment differences count as non-trivial
+/// (normalization would have collapsed those upstream anyway).
+///
+/// Pure, idempotent, side-effect free. Returns false on any parse error.
+pub fn is_trivial_redirect(src: &str, dest: &str) -> bool {
+    let Ok(s) = Url::parse(src) else { return false };
+    let Ok(d) = Url::parse(dest) else { return false };
+
+    // Build a canonical key that erases all four "trivial" differences.
+    let canon = |u: &Url| -> (String, String, Option<String>) {
+        let host = u
+            .host_str()
+            .unwrap_or("")
+            .trim_start_matches("www.")
+            .to_lowercase();
+        let path = u.path().trim_end_matches('/').to_lowercase();
+        let query = u.query().map(|q| q.to_string());
+        (host, path, query)
+    };
+
+    canon(&s) == canon(&d)
+}
+
 // ---------------------------------------------------------------------------
 // Tests (keep in sync with crawler/src/utils/url_normalization.rs tests)
 // ---------------------------------------------------------------------------
@@ -395,12 +433,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_normalize_trailing_slash() {
+    fn test_normalize_preserves_trailing_slash() {
+        // Trailing slashes are preserved — the site's own links decide canonical form.
         let mut normalizer = UrlNormalizer::new();
         assert_eq!(
             normalizer.normalize("https://example.com/page/"),
+            "https://example.com/page/"
+        );
+        assert_eq!(
+            normalizer.normalize("https://example.com/page"),
             "https://example.com/page"
         );
+    }
+
+    #[test]
+    fn test_slash_and_non_slash_are_distinct() {
+        // Critical: /foo and /foo/ must stay distinct so spider fetches the
+        // form the site actually uses. Trivial-redirect handling cleans up
+        // mixed-linking cases downstream (see is_trivial_redirect).
+        let mut normalizer = UrlNormalizer::new();
+        let with_slash = normalizer.normalize("https://example.com/foo/");
+        let without = normalizer.normalize("https://example.com/foo");
+        assert_ne!(with_slash, without);
     }
 
     #[test]
@@ -499,9 +553,10 @@ mod tests {
 
     #[test]
     fn test_normalize_url_in_place() {
+        // Trailing slash preserved; tracking stripped; allowlisted params kept.
         let mut url = Url::parse("https://example.com/page/?utm_source=x&page=2").unwrap();
         normalize_url_in_place(&mut url);
-        assert_eq!(url.as_str(), "https://example.com/page?page=2");
+        assert_eq!(url.as_str(), "https://example.com/page/?page=2");
     }
 
     #[test]
@@ -544,7 +599,7 @@ mod tests {
         );
         assert_eq!(
             n.normalize("https://example.com/?s=shoes"),
-            "https://example.com"
+            "https://example.com/"
         );
         assert_eq!(
             n.normalize("https://example.com/find?search=hello&query=world"),
@@ -642,5 +697,88 @@ mod tests {
         assert_eq!(c, "https://example.com/login");
         assert_eq!(d, "https://example.com/login");
         assert_eq!(e, "https://example.com/login");
+    }
+
+    // --- is_trivial_redirect -----------------------------------------------
+
+    #[test]
+    fn test_is_trivial_redirect_slash_only() {
+        assert!(is_trivial_redirect(
+            "https://example.com/foo",
+            "https://example.com/foo/"
+        ));
+        assert!(is_trivial_redirect(
+            "https://example.com/foo/",
+            "https://example.com/foo"
+        ));
+    }
+
+    #[test]
+    fn test_is_trivial_redirect_www_only() {
+        assert!(is_trivial_redirect(
+            "https://example.com/foo",
+            "https://www.example.com/foo"
+        ));
+        assert!(is_trivial_redirect(
+            "https://www.example.com/foo",
+            "https://example.com/foo"
+        ));
+    }
+
+    #[test]
+    fn test_is_trivial_redirect_scheme_only() {
+        assert!(is_trivial_redirect(
+            "http://example.com/foo",
+            "https://example.com/foo"
+        ));
+    }
+
+    #[test]
+    fn test_is_trivial_redirect_case_only() {
+        assert!(is_trivial_redirect(
+            "https://example.com/Foo",
+            "https://example.com/foo"
+        ));
+    }
+
+    #[test]
+    fn test_is_trivial_redirect_combined() {
+        // All four differences at once → still trivial.
+        assert!(is_trivial_redirect(
+            "http://example.com/Foo",
+            "https://www.example.com/foo/"
+        ));
+    }
+
+    #[test]
+    fn test_is_not_trivial_different_path() {
+        assert!(!is_trivial_redirect(
+            "https://example.com/foo",
+            "https://example.com/bar"
+        ));
+    }
+
+    #[test]
+    fn test_is_not_trivial_different_query() {
+        // Two different query strings are meaningful — not a trivial redirect.
+        assert!(!is_trivial_redirect(
+            "https://example.com/foo?a=1",
+            "https://example.com/foo?b=2"
+        ));
+    }
+
+    #[test]
+    fn test_is_not_trivial_different_host() {
+        // example.com → other.com is a real redirect, not trivial.
+        assert!(!is_trivial_redirect(
+            "https://example.com/foo",
+            "https://other.com/foo"
+        ));
+    }
+
+    #[test]
+    fn test_is_not_trivial_invalid_urls() {
+        assert!(!is_trivial_redirect("not a url", "https://example.com/foo"));
+        assert!(!is_trivial_redirect("https://example.com/foo", "not a url"));
     }
 }
