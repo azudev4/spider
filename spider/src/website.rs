@@ -404,16 +404,23 @@ impl Website {
             CaseInsensitiveString::new(&prepare_url(url)).into()
         };
 
-        // Normalize seed URL so it matches the canonical form that will be
-        // stored in links_visited once the crawl starts extracting links.
-        // Prevents a tracking-tagged start URL from being visited a second time
-        // via its clean canonical form.
-        let mut domain_parsed: Option<Box<Url>> = parse_absolute_url(&url);
-        let url: Box<CaseInsensitiveString> = if let Some(ref mut parsed) = domain_parsed {
-            crate::utils::url_normalization::normalize_url_in_place(parsed.as_mut());
-            CaseInsensitiveString::new(parsed.as_str()).into()
-        } else {
-            url
+        // `domain_parsed` is the base-domain reference used by other code
+        // paths to extract the host for cross-domain checks etc. `parse_absolute_url`
+        // strips the path, which is correct for that purpose.
+        let domain_parsed: Option<Box<Url>> = parse_absolute_url(&url);
+
+        // `self.url` is the SEED URL — the URL the crawler actually fetches
+        // first. It must preserve the path: a seed of
+        // `https://example.com/section` has to crawl `/section`, not `/`.
+        // We parse the *full* URL (with path) and run the same canonical
+        // normalization the rest of the crawler uses (tracking-param strip,
+        // path lowercase, etc.) so the seed matches re-discoveries during BFS.
+        let url: Box<CaseInsensitiveString> = match url::Url::parse(&url) {
+            Ok(mut parsed) => {
+                crate::utils::url_normalization::normalize_url_in_place(&mut parsed);
+                CaseInsensitiveString::new(parsed.as_str()).into()
+            }
+            Err(_) => url,
         };
         let mut status = CrawlStatus::Start;
 
@@ -464,14 +471,18 @@ impl Website {
             CaseInsensitiveString::new(&prepare_url(&url)).into()
         };
 
-        // See Website::_new — normalize the seed so it lands in links_visited
-        // in the same canonical form that push_link produces for re-discoveries.
-        let mut domain_parsed = parse_absolute_url(&domain);
-        let domain: Box<CaseInsensitiveString> = if let Some(ref mut parsed) = domain_parsed {
-            crate::utils::url_normalization::normalize_url_in_place(parsed.as_mut());
-            CaseInsensitiveString::new(parsed.as_str()).into()
-        } else {
-            domain
+        // See Website::_new for the same split:
+        // - `domain_parsed` is host-only (parse_absolute_url strips path); used as
+        //   base-domain reference elsewhere in the crawler.
+        // - `self.url` preserves the path so the seed URL actually points at
+        //   the page the caller asked us to start from.
+        let domain_parsed = parse_absolute_url(&domain);
+        let domain: Box<CaseInsensitiveString> = match url::Url::parse(&domain) {
+            Ok(mut parsed) => {
+                crate::utils::url_normalization::normalize_url_in_place(&mut parsed);
+                CaseInsensitiveString::new(parsed.as_str()).into()
+            }
+            Err(_) => domain,
         };
         self.domain_parsed = domain_parsed;
         self.url = domain;
