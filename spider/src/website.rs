@@ -145,7 +145,10 @@ pub fn is_safe_javascript_challenge(page: &Page) -> bool {
 ))]
 /// Bind connections only on the specified network interface.
 fn set_interface(client: ClientBuilder, network_interface: &str) -> ClientBuilder {
-    client.interface(&network_interface)
+    // wreq's ClientBuilder::interface takes `Into<Cow<'static, str>>`. The
+    // owned-by-ref `&&str` doesn't satisfy that bound; deref to `&str` so the
+    // blanket impl picks up. Same call works under reqwest too.
+    client.interface(network_interface.to_string())
 }
 
 #[cfg(not(any(
