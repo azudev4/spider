@@ -22,6 +22,15 @@ pub fn setup_default_headers(
         }
     }
 
+    // Skip `default_headers(empty)` when no manual headers / referer were
+    // configured. With the `wreq` feature on, `emulation(Chrome136)` installs
+    // a precise Chrome header map; calling `default_headers(empty)` afterwards
+    // replaces that map and breaks the JA3 + headers fingerprint that beats
+    // Akamai/Cloudflare Bot Manager.
+    if headers.0.is_empty() {
+        return client_builder;
+    }
+
     client_builder.default_headers(headers.0)
 }
 
