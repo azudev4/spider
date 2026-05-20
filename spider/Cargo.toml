@@ -121,13 +121,20 @@ tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
 ] }
 fastrand = { version = "2", optional = true }
-reqwest = { version = "0.12", features = [
+# Drop reqwest's `default-tls` (= native-tls → openssl-sys). When wreq's
+# BoringSSL and OpenSSL coexist in the same static link, ld either fails
+# to resolve hidden-visibility OpenSSL-named symbols out of BoringSSL or
+# hits multiple-definition errors on shared C symbols. Rustls keeps
+# OpenSSL out of the graph entirely.
+reqwest = { version = "0.12", default-features = false, features = [
+    "charset",
     "brotli",
     "gzip",
     "deflate",
     "zstd",
     "stream",
-    "http2"
+    "http2",
+    "rustls-tls"
 ] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -137,12 +144,14 @@ tokio = { version = "1", default-features = false, features = [
     "rt",
 ] }
 fastrand = { version = "2", optional = true, features = ["js"] }
-reqwest = { version = "0.12", features = [
+reqwest = { version = "0.12", default-features = false, features = [
+    "charset",
     "brotli",
     "gzip",
     "deflate",
     "stream",
-    "http2"
+    "http2",
+    "rustls-tls"
 ] }
 
 [features]
@@ -156,9 +165,11 @@ __basic = [
     "balance",
     "real_browser"
 ]
+# Swap the disk variant from native-tls to rustls. native-tls drags in
+# openssl-sys, which can't coexist statically with wreq's BoringSSL.
 basic_tls = [
     "reqwest_native_tls_native_roots",
-    "disk_native_tls",
+    "disk_aws",
 ]
 basic = [
     "__basic",
